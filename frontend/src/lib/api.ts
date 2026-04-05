@@ -1,0 +1,48 @@
+// Wails binding wrappers
+// These functions call Go methods bound via Wails
+
+import {
+  GetAuthStatus,
+  SendAuthCode,
+  VerifyAuthCode,
+  VerifyPassword,
+  GetFolders,
+  CreateFolder,
+  RenameFolder,
+  DeleteFolder,
+  GetFiles,
+  UploadFile,
+  UploadFilePath,
+  DeleteFile,
+  RenameFile,
+  GetStreamURL,
+  GetThumbnailURL,
+  RebuildIndex,
+  SyncFolders,
+  GetAPIPort,
+  IsConfigured,
+  SaveConfig,
+} from '../../wailsjs/go/main/App';
+
+export {
+  GetAuthStatus,
+  SendAuthCode,
+  VerifyAuthCode,
+  VerifyPassword,
+  GetFolders,
+  CreateFolder,
+  RenameFolder,
+  DeleteFolder,
+  GetFiles,
+  UploadFile,
+  UploadFilePath,
+  DeleteFile,
+  RenameFile,
+  GetStreamURL,
+  GetThumbnailURL,
+  RebuildIndex,
+  SyncFolders,
+  GetAPIPort,
+  IsConfigured,
+  SaveConfig,
+};
