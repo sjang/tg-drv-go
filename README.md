@@ -2,6 +2,10 @@
 
 A desktop file storage application that uses Telegram as a cloud storage backend. Upload, download, stream, and manage files through a modern desktop interface — all stored in your Telegram channels.
 
+## Screenshot
+
+![TG Drive](docs/images/screenshot.png)
+
 ## Features
 
 - **Telegram as Storage** — Each folder is backed by a private Telegram channel. When you create a folder, the app automatically creates a corresponding Telegram channel. Files uploaded to a folder are stored as messages in that channel, and folder sync pulls the latest state from Telegram.
@@ -122,6 +126,10 @@ MIT
 # TG-Drive-GO (한국어)
 
 Telegram을 클라우드 저장소 백엔드로 사용하는 데스크톱 파일 관리 애플리케이션입니다. 모던 데스크톱 인터페이스를 통해 파일을 업로드, 다운로드, 스트리밍, 관리할 수 있으며, 모든 파일은 Telegram 채널에 저장됩니다.
+
+## 스크린샷
+
+![TG Drive](docs/images/screenshot.png)
 
 ## 주요 기능
 
