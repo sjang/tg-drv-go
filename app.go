@@ -27,9 +27,12 @@ type App struct {
 
 func NewApp() *App {
 	logger, _ := zap.NewDevelopment()
-	return &App{
+	app := &App{
 		logger: logger,
 	}
+	// Create API server early so its Handler can be used by Wails AssetServer
+	app.apiServer = api.NewServer(nil, 9876, logger)
+	return app
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -71,21 +74,28 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}()
 
-	// Start API server in background
-	a.apiServer = api.NewServer(a.tg, cfg.HTTPPort, a.logger)
+	// Set the tg client on the already-created API server
+	a.apiServer.SetClient(a.tg)
+
+	// Start HTTP server on localhost for streaming/download (Wails custom scheme doesn't support Range requests)
 	go func() {
 		if err := a.apiServer.Start(); err != nil {
-			a.logger.Error("api server stopped", zap.Error(err))
+			a.logger.Error("api server failed", zap.Error(err))
 		}
+	}()
+
+	// Wait for Telegram client to be ready
+	go func() {
+		if err := a.tg.WaitReady(tgCtx); err != nil {
+			a.logger.Error("wait ready failed", zap.Error(err))
+		}
+		a.logger.Info("telegram client ready")
 	}()
 }
 
 func (a *App) shutdown(ctx context.Context) {
 	if a.cancel != nil {
 		a.cancel()
-	}
-	if a.apiServer != nil {
-		a.apiServer.Shutdown(ctx)
 	}
 	if a.db != nil {
 		a.db.Close()
@@ -151,6 +161,13 @@ func (a *App) DeleteFolder(id string) error {
 	return a.tg.DeleteChannel(a.ctx, id)
 }
 
+func (a *App) ToggleFolderHidden(id string, hidden bool) error {
+	if a.db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	return a.db.SetFolderHidden(id, hidden)
+}
+
 func (a *App) GetFiles(folderID string) ([]storage.File, error) {
 	if a.db == nil {
 		return nil, fmt.Errorf("database not initialized")
@@ -175,6 +192,35 @@ func (a *App) UploadFile(folderID string) (*storage.File, error) {
 	})
 }
 
+func (a *App) UploadFiles(folderID string) (int, error) {
+	if a.tg == nil {
+		return 0, fmt.Errorf("telegram client not initialized")
+	}
+
+	paths, err := runtime.OpenMultipleFilesDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "Select files to upload",
+	})
+	if err != nil || len(paths) == 0 {
+		return 0, fmt.Errorf("no files selected")
+	}
+
+	total := len(paths)
+	uploaded := 0
+	for i, p := range paths {
+		runtime.EventsEmit(a.ctx, "upload:queue", map[string]int{"current": i + 1, "total": total})
+		_, err := a.tg.UploadFile(a.ctx, folderID, p, func(prog telegram.UploadProgress) {
+			runtime.EventsEmit(a.ctx, "upload:progress", prog)
+		})
+		if err != nil {
+			a.logger.Warn("upload failed", zap.String("path", p), zap.Error(err))
+			continue
+		}
+		uploaded++
+	}
+	runtime.EventsEmit(a.ctx, "upload:queue", map[string]int{"current": 0, "total": 0})
+	return uploaded, nil
+}
+
 func (a *App) UploadFilePath(folderID, filePath string) (*storage.File, error) {
 	if a.tg == nil {
 		return nil, fmt.Errorf("telegram client not initialized")
@@ -182,6 +228,85 @@ func (a *App) UploadFilePath(folderID, filePath string) (*storage.File, error) {
 	return a.tg.UploadFile(a.ctx, folderID, filePath, func(p telegram.UploadProgress) {
 		runtime.EventsEmit(a.ctx, "upload:progress", p)
 	})
+}
+
+func (a *App) DownloadFileTo(fileID string) error {
+	if a.tg == nil {
+		return fmt.Errorf("telegram client not initialized")
+	}
+	if a.db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	file, err := a.db.GetFile(fileID)
+	if err != nil {
+		return fmt.Errorf("get file: %w", err)
+	}
+
+	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "Save file",
+		DefaultFilename: file.Name,
+	})
+	if err != nil || savePath == "" {
+		return fmt.Errorf("no save location selected")
+	}
+
+	out, err := os.Create(savePath)
+	if err != nil {
+		return fmt.Errorf("create file: %w", err)
+	}
+	defer out.Close()
+
+	return a.tg.DownloadFileWithProgress(a.ctx, fileID, out, func(p telegram.DownloadProgress) {
+		runtime.EventsEmit(a.ctx, "download:progress", p)
+	})
+}
+
+func (a *App) DownloadFilesTo(fileIDs []string) (int, error) {
+	if a.tg == nil {
+		return 0, fmt.Errorf("telegram client not initialized")
+	}
+	if a.db == nil {
+		return 0, fmt.Errorf("database not initialized")
+	}
+
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "Select download folder",
+	})
+	if err != nil || dir == "" {
+		return 0, fmt.Errorf("no folder selected")
+	}
+
+	downloaded := 0
+	total := len(fileIDs)
+	for i, fid := range fileIDs {
+		file, err := a.db.GetFile(fid)
+		if err != nil {
+			a.logger.Warn("download: file not found", zap.String("id", fid))
+			continue
+		}
+
+		runtime.EventsEmit(a.ctx, "download:queue", map[string]int{"current": i + 1, "total": total})
+
+		savePath := filepath.Join(dir, file.Name)
+		out, err := os.Create(savePath)
+		if err != nil {
+			a.logger.Warn("download: create file", zap.String("path", savePath), zap.Error(err))
+			continue
+		}
+
+		err = a.tg.DownloadFileWithProgress(a.ctx, fid, out, func(p telegram.DownloadProgress) {
+			runtime.EventsEmit(a.ctx, "download:progress", p)
+		})
+		out.Close()
+		if err != nil {
+			a.logger.Warn("download failed", zap.String("file", file.Name), zap.Error(err))
+			continue
+		}
+		downloaded++
+	}
+	runtime.EventsEmit(a.ctx, "download:queue", map[string]int{"current": 0, "total": 0})
+	return downloaded, nil
 }
 
 func (a *App) DeleteFile(fileID string) error {
@@ -204,6 +329,15 @@ func (a *App) GetStreamURL(fileID string) string {
 
 func (a *App) GetThumbnailURL(fileID string) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/api/files/%s/thumbnail", a.cfg.HTTPPort, fileID)
+}
+
+func (a *App) GetDownloadURL(fileID string) string {
+	return fmt.Sprintf("http://127.0.0.1:%d/api/files/%s/download", a.cfg.HTTPPort, fileID)
+}
+
+func (a *App) OpenPlayer(fileID string) {
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/files/%s/player", a.cfg.HTTPPort, fileID)
+	runtime.BrowserOpenURL(a.ctx, url)
 }
 
 func (a *App) RebuildIndex(folderID string) (int, error) {

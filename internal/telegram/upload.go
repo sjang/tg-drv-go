@@ -2,10 +2,13 @@ package telegram
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"mime"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
@@ -89,8 +92,16 @@ func (c *Client) UploadFile(ctx context.Context, folderID, localPath string, onP
 		return c.forwardFile(ctx, dup, folder, fileName, fileSize, mimeType, fileHash)
 	}
 
-	// Upload new file
-	upload, err := c.uploader.FromPath(ctx, localPath)
+	// Upload new file with progress tracking
+	u := c.uploader
+	if onProgress != nil {
+		u = u.WithProgress(&progressCallback{
+			fileID:   folderID + ":" + fileName,
+			fileName: fileName,
+			onUpdate: onProgress,
+		})
+	}
+	upload, err := u.FromPath(ctx, localPath)
 	if err != nil {
 		return nil, fmt.Errorf("upload: %w", err)
 	}
@@ -102,16 +113,24 @@ func (c *Client) UploadFile(ctx context.Context, folderID, localPath string, onP
 		AccessHash: folder.AccessHash,
 	}
 
+	attrs := []tg.DocumentAttributeClass{
+		&tg.DocumentAttributeFilename{FileName: fileName},
+	}
+	if strings.HasPrefix(mimeType, "video/") {
+		attrs = append(attrs, &tg.DocumentAttributeVideo{
+			SupportsStreaming: true,
+		})
+	}
+
 	updates, err := c.api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
 		Peer: inputPeer,
 		Media: &tg.InputMediaUploadedDocument{
-			File:     upload,
-			MimeType: mimeType,
-			Attributes: []tg.DocumentAttributeClass{
-				&tg.DocumentAttributeFilename{FileName: fileName},
-			},
+			File:       upload,
+			MimeType:   mimeType,
+			Attributes: attrs,
 		},
-		Message: caption,
+		Message:  caption,
+		RandomID: cryptoRandInt64(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("send media: %w", err)
@@ -265,6 +284,12 @@ func (c *Client) RenameFile(ctx context.Context, fileID, newName string) error {
 	}
 
 	return c.db.RenameFile(fileID, newName)
+}
+
+func cryptoRandInt64() int64 {
+	var b [8]byte
+	rand.Read(b[:])
+	return int64(binary.LittleEndian.Uint64(b[:]))
 }
 
 // unused import guard

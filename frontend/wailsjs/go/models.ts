@@ -64,6 +64,7 @@ export namespace storage {
 	    updated_at: any;
 	    file_count?: number;
 	    total_size?: number;
+	    hidden: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new Folder(source);
@@ -79,6 +80,7 @@ export namespace storage {
 	        this.updated_at = this.convertValues(source["updated_at"], null);
 	        this.file_count = source["file_count"];
 	        this.total_size = source["total_size"];
+	        this.hidden = source["hidden"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

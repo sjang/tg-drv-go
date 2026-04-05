@@ -9,9 +9,15 @@ export function DeleteFile(arg1:string):Promise<void>;
 
 export function DeleteFolder(arg1:string):Promise<void>;
 
+export function DownloadFileTo(arg1:string):Promise<void>;
+
+export function DownloadFilesTo(arg1:Array<string>):Promise<number>;
+
 export function GetAPIPort():Promise<number>;
 
 export function GetAuthStatus():Promise<telegram.AuthStatus>;
+
+export function GetDownloadURL(arg1:string):Promise<string>;
 
 export function GetFiles(arg1:string):Promise<Array<storage.File>>;
 
@@ -22,6 +28,8 @@ export function GetStreamURL(arg1:string):Promise<string>;
 export function GetThumbnailURL(arg1:string):Promise<string>;
 
 export function IsConfigured():Promise<boolean>;
+
+export function OpenPlayer(arg1:string):Promise<void>;
 
 export function RebuildIndex(arg1:string):Promise<number>;
 
@@ -35,9 +43,13 @@ export function SendAuthCode(arg1:string):Promise<void>;
 
 export function SyncFolders():Promise<Array<storage.Folder>>;
 
+export function ToggleFolderHidden(arg1:string,arg2:boolean):Promise<void>;
+
 export function UploadFile(arg1:string):Promise<storage.File>;
 
 export function UploadFilePath(arg1:string,arg2:string):Promise<storage.File>;
+
+export function UploadFiles(arg1:string):Promise<number>;
 
 export function VerifyAuthCode(arg1:string):Promise<void>;
 

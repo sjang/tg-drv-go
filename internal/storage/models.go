@@ -11,6 +11,7 @@ type Folder struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 	FileCount  int       `json:"file_count,omitempty"`
 	TotalSize  int64     `json:"total_size,omitempty"`
+	Hidden     bool      `json:"hidden"`
 }
 
 type File struct {

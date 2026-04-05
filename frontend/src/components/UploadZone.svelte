@@ -1,11 +1,16 @@
 <script lang="ts">
-  import { currentFolder, files } from '../lib/stores';
-  import { UploadFilePath, GetFiles } from '../lib/api';
+  import { onMount, onDestroy } from 'svelte';
+  import { OnFileDrop, OnFileDropOff } from '../../wailsjs/runtime/runtime';
+  import { currentFolder, uploadQueue, refreshFiles } from '../lib/stores';
+  import { UploadFilePath } from '../lib/api';
 
   let isDragging = false;
+  let uploading = false;
+  let dragCount = 0;
 
   function handleDragEnter(e: DragEvent) {
     e.preventDefault();
+    dragCount++;
     if ($currentFolder) isDragging = true;
   }
 
@@ -15,36 +20,51 @@
 
   function handleDragLeave(e: DragEvent) {
     e.preventDefault();
-    // Only hide if we're leaving the window
-    if (e.relatedTarget === null) isDragging = false;
+    dragCount--;
+    if (dragCount <= 0) {
+      isDragging = false;
+      dragCount = 0;
+    }
   }
 
-  async function handleDrop(e: DragEvent) {
+  function handleDrop(e: DragEvent) {
     e.preventDefault();
     isDragging = false;
+    dragCount = 0;
+    // File paths are handled by Wails native file-drop event below
+  }
 
-    if (!$currentFolder || !e.dataTransfer?.files) return;
-
-    const droppedFiles = e.dataTransfer.files;
-    for (let i = 0; i < droppedFiles.length; i++) {
-      const file = droppedFiles[i];
-      // In Wails/WebKit on macOS, we can access the file path
-      const path = (file as any).path;
-      if (path) {
+  // Wails native file drop handler
+  async function onFileDrop(_x: number, _y: number, paths: string[]) {
+    if (!$currentFolder || uploading || !paths || paths.length === 0) return;
+    uploading = true;
+    const total = paths.length;
+    uploadQueue.set({ current: 1, total });
+    try {
+      for (let i = 0; i < paths.length; i++) {
+        uploadQueue.set({ current: i + 1, total });
         try {
-          await UploadFilePath($currentFolder.id, path);
+          await UploadFilePath($currentFolder.id, paths[i]);
         } catch (err) {
-          console.error('upload error:', err);
+          console.error('upload error:', paths[i], err);
         }
       }
-    }
-
-    // Refresh file list
-    if ($currentFolder) {
-      const result = await GetFiles($currentFolder.id);
-      files.set(result || []);
+      await refreshFiles();
+    } finally {
+      uploading = false;
+      uploadQueue.set({ current: 0, total: 0 });
     }
   }
+
+  onMount(() => {
+    OnFileDrop((x: number, y: number, paths: string[]) => {
+      onFileDrop(x, y, paths);
+    }, true);
+  });
+
+  onDestroy(() => {
+    OnFileDropOff();
+  });
 </script>
 
 <svelte:window
@@ -54,8 +74,8 @@
   on:drop={handleDrop}
 />
 
-{#if isDragging}
-  <div class="drop-overlay">
+{#if isDragging && $currentFolder}
+  <div class="drop-overlay" style="--wails-drop-target: drop">
     <div class="drop-content">
       <span class="drop-icon">{'\u{1F4E5}'}</span>
       <p>Drop files to upload</p>
@@ -63,6 +83,7 @@
     </div>
   </div>
 {/if}
+
 
 <style>
   .drop-overlay {
@@ -77,7 +98,6 @@
     align-items: center;
     justify-content: center;
     z-index: 300;
-    pointer-events: none;
   }
 
   .drop-content {
@@ -102,4 +122,5 @@
     opacity: 0.8;
     margin-top: 4px;
   }
+
 </style>

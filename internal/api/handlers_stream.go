@@ -42,16 +42,21 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", file.MimeType)
 
 	rangeHeader := r.Header.Get("Range")
+
+	// If no Range header, return 200 with Content-Length so the player
+	// knows the file size and can make targeted Range requests.
 	if rangeHeader == "" {
-		// Full stream
 		w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
+		w.WriteHeader(http.StatusOK)
 		if err := s.tg.DownloadFile(r.Context(), fileID, w); err != nil {
-			s.logger.Error("stream failed", zap.String("file_id", fileID), zap.Error(err))
+			s.logger.Error("download failed",
+				zap.String("file_id", fileID),
+				zap.Error(err),
+			)
 		}
 		return
 	}
 
-	// Parse Range header: "bytes=START-END"
 	start, end, err := parseRange(rangeHeader, file.Size)
 	if err != nil {
 		writeError(w, http.StatusRequestedRangeNotSatisfiable, err.Error())
@@ -64,12 +69,20 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusPartialContent)
 
 	if err := s.tg.DownloadRange(r.Context(), fileID, w, start, length); err != nil {
-		s.logger.Error("range stream failed",
-			zap.String("file_id", fileID),
-			zap.Int64("start", start),
-			zap.Int64("length", length),
-			zap.Error(err),
-		)
+		// "connection reset by peer" is normal when the player seeks or cancels
+		if r.Context().Err() != nil {
+			s.logger.Debug("stream cancelled (client disconnected)",
+				zap.String("file_id", fileID),
+				zap.Int64("start", start),
+			)
+		} else {
+			s.logger.Error("stream failed",
+				zap.String("file_id", fileID),
+				zap.Int64("start", start),
+				zap.Int64("length", length),
+				zap.Error(err),
+			)
+		}
 	}
 }
 
@@ -87,6 +100,33 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	w.Write(thumb)
 }
 
+func (s *Server) handlePlayer(w http.ResponseWriter, r *http.Request) {
+	fileID := chi.URLParam(r, "id")
+
+	file, err := s.tg.Storage().GetFile(fileID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "file not found")
+		return
+	}
+
+	streamURL := fmt.Sprintf("/api/files/%s/stream", fileID)
+	var mediaTag string
+	if strings.HasPrefix(file.MimeType, "video/") {
+		mediaTag = fmt.Sprintf(`<video controls autoplay src="%s" style="max-width:100vw;max-height:100vh;"></video>`, streamURL)
+	} else if strings.HasPrefix(file.MimeType, "audio/") {
+		mediaTag = fmt.Sprintf(`<audio controls autoplay src="%s"></audio>`, streamURL)
+	} else if strings.HasPrefix(file.MimeType, "image/") {
+		mediaTag = fmt.Sprintf(`<img src="%s" alt="%s" style="max-width:100vw;max-height:100vh;object-fit:contain;" />`, streamURL, file.Name)
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>%s</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#111;display:flex;align-items:center;justify-content:center;min-height:100vh;}</style>
+</head><body>%s</body></html>`, file.Name, mediaTag)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html))
+}
+
 func parseRange(rangeHeader string, totalSize int64) (start, end int64, err error) {
 	if !strings.HasPrefix(rangeHeader, "bytes=") {
 		return 0, 0, fmt.Errorf("invalid range header")
@@ -99,7 +139,6 @@ func parseRange(rangeHeader string, totalSize int64) (start, end int64, err erro
 	}
 
 	if parts[0] == "" {
-		// Suffix range: -500 means last 500 bytes
 		suffixLen, err := strconv.ParseInt(parts[1], 10, 64)
 		if err != nil {
 			return 0, 0, fmt.Errorf("invalid suffix range")

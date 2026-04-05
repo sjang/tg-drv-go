@@ -134,6 +134,22 @@ func (c *Client) SyncChannels(ctx context.Context) ([]storage.Folder, error) {
 			folders = append(folders, *existing)
 		}
 	}
+
+	// Rebuild file index for each synced folder
+	for i, folder := range folders {
+		count, err := c.RebuildIndex(ctx, folder.ID)
+		if err != nil {
+			c.logger.Warn("sync: rebuild index failed", zap.String("folder", folder.Name), zap.Error(err))
+			continue
+		}
+		// Re-read folder to get updated file_count/total_size
+		updated, err := c.db.GetFolder(folder.ID)
+		if err == nil {
+			folders[i] = *updated
+		}
+		c.logger.Info("sync: indexed folder", zap.String("folder", folder.Name), zap.Int("files", count))
+	}
+
 	return folders, nil
 }
 
@@ -170,6 +186,7 @@ func ParseCaption(caption string) (filename, mimeType, hash string, size int64, 
 	return filename, meta.MimeType, meta.Hash, meta.Size, true
 }
 
+// RebuildIndex performs incremental sync: fetches only new messages and verifies deletions.
 func (c *Client) RebuildIndex(ctx context.Context, folderID string) (int, error) {
 	folder, err := c.db.GetFolder(folderID)
 	if err != nil {
@@ -185,23 +202,24 @@ func (c *Client) RebuildIndex(ctx context.Context, folderID string) (int, error)
 		AccessHash: folder.AccessHash,
 	}
 
-	// Delete existing files for this folder
-	_, err = c.db.Exec("DELETE FROM files WHERE folder_id = ?", folderID)
+	// Phase 1: Incremental — fetch messages newer than the latest known message_id
+	maxMsgID, err := c.db.MaxMessageID(folderID)
 	if err != nil {
-		return 0, fmt.Errorf("clear files: %w", err)
+		return 0, fmt.Errorf("get max message_id: %w", err)
 	}
 
-	count := 0
-	offsetID := 0
+	added := 0
+	offsetID := 0 // start from newest
+	done := false
 
-	for {
+	for !done {
 		history, err := c.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 			Peer:     peer,
 			Limit:    100,
 			OffsetID: offsetID,
 		})
 		if err != nil {
-			return count, fmt.Errorf("get history: %w", err)
+			return added, fmt.Errorf("get history: %w", err)
 		}
 
 		var messages []tg.MessageClass
@@ -220,7 +238,21 @@ func (c *Client) RebuildIndex(ctx context.Context, folderID string) (int, error)
 
 		for _, msgClass := range messages {
 			msg, ok := msgClass.(*tg.Message)
-			if !ok || msg.Media == nil {
+			if !ok {
+				continue
+			}
+
+			// Stop when we reach already-indexed messages
+			if msg.ID <= maxMsgID {
+				// But skip if this exact message is already in DB
+				exists, _ := c.db.FileExistsByMessageID(folderID, msg.ID)
+				if exists {
+					done = true
+					break
+				}
+			}
+
+			if msg.Media == nil {
 				continue
 			}
 
@@ -234,9 +266,14 @@ func (c *Client) RebuildIndex(ctx context.Context, folderID string) (int, error)
 				continue
 			}
 
+			// Skip if already indexed
+			exists, _ := c.db.FileExistsByMessageID(folderID, msg.ID)
+			if exists {
+				continue
+			}
+
 			filename, mimeType, hash, size, parsed := ParseCaption(msg.Message)
 			if !parsed {
-				// Try to extract from document attributes
 				for _, attr := range document.Attributes {
 					if fa, ok := attr.(*tg.DocumentAttributeFilename); ok {
 						filename = fa.FileName
@@ -258,10 +295,10 @@ func (c *Client) RebuildIndex(ctx context.Context, folderID string) (int, error)
 				nil, false, "",
 			)
 			if err != nil {
-				c.logger.Warn("rebuild: skip file", zap.Int("msg_id", msg.ID), zap.Error(err))
+				c.logger.Warn("sync: skip file", zap.Int("msg_id", msg.ID), zap.Error(err))
 				continue
 			}
-			count++
+			added++
 		}
 
 		lastMsg := messages[len(messages)-1]
@@ -271,11 +308,102 @@ func (c *Client) RebuildIndex(ctx context.Context, folderID string) (int, error)
 		case *tg.MessageService:
 			offsetID = m.ID
 		default:
-			break
+			done = true
 		}
 	}
 
-	_ = inputChannel
-	c.logger.Info("rebuilt index", zap.String("folder", folder.Name), zap.Int("files", count))
-	return count, nil
+	// Phase 2: Deletion verification — check if DB files still exist in Telegram
+	deleted := 0
+	msgIDs, err := c.db.ListMessageIDs(folderID)
+	if err != nil {
+		c.logger.Warn("sync: failed to list message IDs", zap.Error(err))
+	} else if len(msgIDs) > 0 {
+		deleted, err = c.verifyDeletions(ctx, inputChannel, folderID, msgIDs)
+		if err != nil {
+			c.logger.Warn("sync: deletion check failed", zap.Error(err))
+		}
+	}
+
+	totalFiles, _ := c.db.MaxMessageID(folderID) // just for logging
+	_ = totalFiles
+	c.logger.Info("sync complete",
+		zap.String("folder", folder.Name),
+		zap.Int("added", added),
+		zap.Int("deleted", deleted),
+	)
+
+	// Return total file count
+	allMsgIDs, _ := c.db.ListMessageIDs(folderID)
+	return len(allMsgIDs), nil
+}
+
+// verifyDeletions checks if messages still exist in Telegram, removes DB entries for deleted ones.
+func (c *Client) verifyDeletions(ctx context.Context, channel *tg.InputChannel, folderID string, msgIDs []int) (int, error) {
+	deleted := 0
+	// Process in batches of 100 (Telegram API limit)
+	for i := 0; i < len(msgIDs); i += 100 {
+		end := i + 100
+		if end > len(msgIDs) {
+			end = len(msgIDs)
+		}
+		batch := msgIDs[i:end]
+
+		ids := make([]tg.InputMessageClass, len(batch))
+		for j, id := range batch {
+			ids[j] = &tg.InputMessageID{ID: id}
+		}
+
+		result, err := c.api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+			Channel: channel,
+			ID:      ids,
+		})
+		if err != nil {
+			return deleted, fmt.Errorf("get messages batch: %w", err)
+		}
+
+		var messages []tg.MessageClass
+		switch m := result.(type) {
+		case *tg.MessagesMessages:
+			messages = m.Messages
+		case *tg.MessagesChannelMessages:
+			messages = m.Messages
+		}
+
+		// Build set of existing message IDs
+		existingIDs := make(map[int]bool)
+		for _, msgClass := range messages {
+			switch m := msgClass.(type) {
+			case *tg.Message:
+				existingIDs[m.ID] = true
+			case *tg.MessageEmpty:
+				// This message was deleted
+			}
+		}
+
+		// Find deleted message IDs
+		var deletedIDs []int
+		for _, id := range batch {
+			if !existingIDs[id] {
+				deletedIDs = append(deletedIDs, id)
+			}
+		}
+
+		if len(deletedIDs) > 0 {
+			n, err := c.db.DeleteFilesByMessageIDs(folderID, deletedIDs)
+			if err != nil {
+				c.logger.Warn("sync: delete files failed", zap.Error(err))
+			}
+			deleted += int(n)
+		}
+	}
+	return deleted, nil
+}
+
+// FullRebuildIndex clears all files and rescans from scratch (for disaster recovery).
+func (c *Client) FullRebuildIndex(ctx context.Context, folderID string) (int, error) {
+	_, err := c.db.Exec("DELETE FROM files WHERE folder_id = ?", folderID)
+	if err != nil {
+		return 0, fmt.Errorf("clear files: %w", err)
+	}
+	return c.RebuildIndex(ctx, folderID)
 }

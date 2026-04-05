@@ -1,12 +1,53 @@
 <script lang="ts">
-  import { files, currentFolder, viewMode, isLoading } from '../lib/stores';
-  import { DeleteFile, RenameFile, GetStreamURL, GetThumbnailURL, GetFiles } from '../lib/api';
+  import { files, currentFolder, viewMode, isLoading, refreshFiles } from '../lib/stores';
+  import { DeleteFile, RenameFile, DownloadFileTo, DownloadFilesTo, OpenPlayer } from '../lib/api';
   import type { FileItem } from '../lib/types';
 
   let contextMenu: { x: number; y: number; file: FileItem } | null = null;
   let renameId: string | null = null;
   let renameValue = '';
-  let mediaFile: { url: string; type: string; name: string } | null = null;
+  let deleteConfirm: FileItem | null = null;
+  let selectedIds: Set<string> = new Set();
+  let deleteMultiConfirm = false;
+  let lastClickedId: string | null = null;
+
+  $: selectedCount = selectedIds.size;
+
+  function clearSelection() {
+    selectedIds = new Set();
+  }
+
+  // Clear selection when folder changes
+  $: if ($currentFolder) clearSelection();
+
+  function toggleSelect(e: MouseEvent, file: FileItem) {
+    e.stopPropagation();
+    const newSet = new Set(selectedIds);
+
+    if (e.shiftKey && lastClickedId) {
+      // Range select
+      const ids = $files.map(f => f.id);
+      const from = ids.indexOf(lastClickedId);
+      const to = ids.indexOf(file.id);
+      const [start, end] = from < to ? [from, to] : [to, from];
+      for (let i = start; i <= end; i++) {
+        newSet.add(ids[i]);
+      }
+    } else {
+      if (newSet.has(file.id)) {
+        newSet.delete(file.id);
+      } else {
+        newSet.add(file.id);
+      }
+    }
+
+    lastClickedId = file.id;
+    selectedIds = newSet;
+  }
+
+  function selectAll() {
+    selectedIds = new Set($files.map(f => f.id));
+  }
 
   function formatSize(bytes: number): string {
     if (!bytes) return '0 B';
@@ -39,12 +80,9 @@
   }
 
   async function openFile(file: FileItem) {
-    if (isPlayable(file.mime_type)) {
-      const url = await GetStreamURL(file.id);
-      mediaFile = { url, type: file.mime_type, name: file.name };
-    } else if (file.mime_type.startsWith('image/')) {
-      const url = await GetStreamURL(file.id);
-      mediaFile = { url, type: file.mime_type, name: file.name };
+    if (selectedCount > 0) return; // don't open while selecting
+    if (isPlayable(file.mime_type) || file.mime_type.startsWith('image/')) {
+      await OpenPlayer(file.id);
     }
   }
 
@@ -58,23 +96,83 @@
   }
 
   async function downloadFile(file: FileItem) {
-    const url = await GetStreamURL(file.id);
-    window.open(url.replace('/stream', '/download'), '_blank');
     hideContext();
+    try {
+      await DownloadFileTo(file.id);
+    } catch (e) {
+      if (!String(e).includes('no save location')) {
+        console.error('download:', e);
+      }
+    }
   }
 
-  async function deleteFile(file: FileItem) {
-    hideContext();
-    if (!confirm(`Delete "${file.name}"?`)) return;
-    try {
-      await DeleteFile(file.id);
-      if ($currentFolder) {
-        const result = await GetFiles($currentFolder.id);
-        files.set(result || []);
+  async function downloadSelected() {
+    if (selectedCount === 0) return;
+    const ids = [...selectedIds];
+    if (ids.length === 1) {
+      const file = $files.find(f => f.id === ids[0]);
+      if (file) await downloadFile(file);
+    } else {
+      try {
+        await DownloadFilesTo(ids);
+      } catch (e) {
+        if (!String(e).includes('no folder selected')) {
+          console.error('download:', e);
+        }
       }
+    }
+  }
+
+  function deleteFile(file: FileItem) {
+    hideContext();
+    if (selectedCount > 1) {
+      deleteMultiConfirm = true;
+    } else {
+      deleteConfirm = file;
+    }
+  }
+
+  function requestDeleteSelected() {
+    if (selectedCount === 0) return;
+    if (selectedCount === 1) {
+      const id = [...selectedIds][0];
+      deleteConfirm = $files.find(f => f.id === id) || null;
+    } else {
+      deleteMultiConfirm = true;
+    }
+  }
+
+  async function confirmDelete() {
+    if (!deleteConfirm) return;
+    const fileId = deleteConfirm.id;
+    deleteConfirm = null;
+    try {
+      await DeleteFile(fileId);
+      selectedIds.delete(fileId);
+      selectedIds = selectedIds;
+      await refreshFiles();
     } catch (e) {
       console.error('delete file:', e);
     }
+  }
+
+  async function confirmDeleteMulti() {
+    deleteMultiConfirm = false;
+    const ids = [...selectedIds];
+    try {
+      for (const id of ids) {
+        await DeleteFile(id);
+      }
+      clearSelection();
+      await refreshFiles();
+    } catch (e) {
+      console.error('delete files:', e);
+    }
+  }
+
+  function cancelDelete() {
+    deleteConfirm = null;
+    deleteMultiConfirm = false;
   }
 
   function startRename(file: FileItem) {
@@ -91,23 +189,43 @@
     try {
       await RenameFile(renameId, renameValue.trim());
       renameId = null;
-      if ($currentFolder) {
-        const result = await GetFiles($currentFolder.id);
-        files.set(result || []);
-      }
+      await refreshFiles();
     } catch (e) {
       console.error('rename file:', e);
     }
   }
 
-  function closeMedia() {
-    mediaFile = null;
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape' && selectedCount > 0) {
+      clearSelection();
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key === 'a' && $currentFolder && $files.length > 0) {
+      e.preventDefault();
+      selectAll();
+    }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (selectedCount > 0 && !renameId) {
+        e.preventDefault();
+        requestDeleteSelected();
+      }
+    }
   }
 </script>
 
-<svelte:window on:click={hideContext} />
+<svelte:window on:click={hideContext} on:keydown={handleKeydown} />
 
 <div class="file-area">
+  {#if selectedCount > 0}
+    <div class="selection-bar">
+      <span>{selectedCount} selected</span>
+      <div class="selection-actions">
+        <button class="sel-btn download" on:click={downloadSelected}>Download</button>
+        <button class="sel-btn danger" on:click={requestDeleteSelected}>Delete</button>
+        <button class="sel-btn" on:click={clearSelection}>Cancel</button>
+      </div>
+    </div>
+  {/if}
+
   {#if $isLoading}
     <div class="loading">Loading...</div>
   {:else if !$currentFolder}
@@ -125,6 +243,7 @@
     <div class="file-container" class:grid-view={$viewMode === 'grid'} class:list-view={$viewMode === 'list'}>
       {#if $viewMode === 'list'}
         <div class="list-header">
+          <span class="col-check"></span>
           <span class="col-name">Name</span>
           <span class="col-size">Size</span>
           <span class="col-type">Type</span>
@@ -135,11 +254,13 @@
       {#each $files as file}
         <div
           class="file-item"
+          class:selected={selectedIds.has(file.id)}
           on:click={() => openFile(file)}
           on:contextmenu={(e) => showContext(e, file)}
           on:dblclick={() => startRename(file)}
         >
           {#if $viewMode === 'grid'}
+            <input type="checkbox" class="file-check" checked={selectedIds.has(file.id)} on:click={(e) => toggleSelect(e, file)} />
             <div class="file-icon">{getFileIcon(file.mime_type)}</div>
             {#if renameId === file.id}
               <input
@@ -154,6 +275,9 @@
             {/if}
             <span class="file-size">{formatSize(file.size)}</span>
           {:else}
+            <span class="col-check">
+              <input type="checkbox" class="file-check" checked={selectedIds.has(file.id)} on:click={(e) => toggleSelect(e, file)} />
+            </span>
             <span class="col-name">
               <span class="file-icon-small">{getFileIcon(file.mime_type)}</span>
               {#if renameId === file.id}
@@ -181,32 +305,43 @@
 <!-- Context Menu -->
 {#if contextMenu}
   <div class="context-menu" style="left: {contextMenu.x}px; top: {contextMenu.y}px">
-    {#if isPlayable(contextMenu.file.mime_type)}
-      <button on:click={() => openFile(contextMenu.file)}>Play</button>
+    {#if selectedCount <= 1}
+      {#if isPlayable(contextMenu.file.mime_type)}
+        <button on:click={() => openFile(contextMenu.file)}>Play</button>
+      {/if}
+      <button on:click={() => downloadFile(contextMenu.file)}>Download</button>
+      <button on:click={() => startRename(contextMenu.file)}>Rename</button>
+    {:else}
+      <button on:click={downloadSelected}>Download ({selectedCount})</button>
     {/if}
-    <button on:click={() => downloadFile(contextMenu.file)}>Download</button>
-    <button on:click={() => startRename(contextMenu.file)}>Rename</button>
-    <button class="danger" on:click={() => deleteFile(contextMenu.file)}>Delete</button>
+    <button class="danger" on:click={() => deleteFile(contextMenu.file)}>
+      Delete{#if selectedCount > 1} ({selectedCount}){/if}
+    </button>
   </div>
 {/if}
 
-<!-- Media Player Modal -->
-{#if mediaFile}
-  <div class="modal-overlay" on:click={closeMedia}>
-    <div class="modal-content" on:click|stopPropagation>
-      <div class="modal-header">
-        <span>{mediaFile.name}</span>
-        <button class="close-btn" on:click={closeMedia}>&times;</button>
+<!-- Single Delete Confirmation -->
+{#if deleteConfirm}
+  <div class="modal-overlay" on:click={cancelDelete}>
+    <div class="confirm-dialog" on:click|stopPropagation>
+      <p>Delete "<strong>{deleteConfirm.name}</strong>"?</p>
+      <div class="confirm-actions">
+        <button class="cancel-btn" on:click={cancelDelete}>Cancel</button>
+        <button class="delete-btn" on:click={confirmDelete}>Delete</button>
       </div>
-      {#if mediaFile.type.startsWith('video/')}
-        <video controls autoplay src={mediaFile.url} style="max-width: 100%; max-height: 80vh;">
-          <track kind="captions" />
-        </video>
-      {:else if mediaFile.type.startsWith('audio/')}
-        <audio controls autoplay src={mediaFile.url}></audio>
-      {:else if mediaFile.type.startsWith('image/')}
-        <img src={mediaFile.url} alt={mediaFile.name} style="max-width: 100%; max-height: 80vh;" />
-      {/if}
+    </div>
+  </div>
+{/if}
+
+<!-- Multi Delete Confirmation -->
+{#if deleteMultiConfirm}
+  <div class="modal-overlay" on:click={cancelDelete}>
+    <div class="confirm-dialog" on:click|stopPropagation>
+      <p>Delete <strong>{selectedCount} files</strong>?</p>
+      <div class="confirm-actions">
+        <button class="cancel-btn" on:click={cancelDelete}>Cancel</button>
+        <button class="delete-btn" on:click={confirmDeleteMulti}>Delete All</button>
+      </div>
     </div>
   </div>
 {/if}
@@ -216,6 +351,53 @@
     flex: 1;
     overflow-y: auto;
     padding: 16px;
+  }
+
+  .selection-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    margin-bottom: 12px;
+    background: var(--accent);
+    color: white;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .selection-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .sel-btn {
+    padding: 4px 14px;
+    background: rgba(255,255,255,0.2);
+    color: white;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .sel-btn:hover {
+    background: rgba(255,255,255,0.3);
+  }
+
+  .sel-btn.download {
+    background: #10b981;
+  }
+
+  .sel-btn.download:hover {
+    opacity: 0.9;
+  }
+
+  .sel-btn.danger {
+    background: var(--danger);
+  }
+
+  .sel-btn.danger:hover {
+    opacity: 0.9;
   }
 
   .loading {
@@ -253,6 +435,7 @@
   }
 
   .grid-view .file-item {
+    position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -266,6 +449,19 @@
 
   .grid-view .file-item:hover {
     background: var(--bg-hover);
+  }
+
+  .grid-view .file-check {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+
+  .grid-view .file-item:hover .file-check,
+  .grid-view .file-item.selected .file-check {
+    opacity: 1;
   }
 
   .file-icon {
@@ -295,7 +491,7 @@
 
   .list-header {
     display: grid;
-    grid-template-columns: 1fr 100px 120px 160px;
+    grid-template-columns: 30px 1fr 100px 120px 160px;
     padding: 8px 12px;
     font-size: 12px;
     color: var(--text-secondary);
@@ -306,7 +502,7 @@
 
   .list-view .file-item {
     display: grid;
-    grid-template-columns: 1fr 100px 120px 160px;
+    grid-template-columns: 30px 1fr 100px 120px 160px;
     padding: 10px 12px;
     border-bottom: 1px solid var(--border);
     cursor: pointer;
@@ -315,6 +511,23 @@
 
   .list-view .file-item:hover {
     background: var(--bg-hover);
+  }
+
+  .file-item.selected {
+    background: rgba(74, 158, 255, 0.12);
+  }
+
+  .col-check {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .file-check {
+    width: 15px;
+    height: 15px;
+    cursor: pointer;
+    accent-color: var(--accent);
   }
 
   .col-name {
@@ -392,36 +605,45 @@
     z-index: 200;
   }
 
-  .modal-content {
+  .confirm-dialog {
     background: var(--bg-secondary);
     border-radius: 12px;
-    overflow: hidden;
-    max-width: 90vw;
-    max-height: 90vh;
+    padding: 24px;
+    min-width: 320px;
+    box-shadow: 0 8px 32px var(--shadow);
   }
 
-  .modal-header {
+  .confirm-dialog p {
+    margin-bottom: 20px;
+    font-size: 15px;
+  }
+
+  .confirm-actions {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
+    justify-content: flex-end;
+    gap: 10px;
   }
 
-  .close-btn {
-    width: 32px;
-    height: 32px;
+  .cancel-btn {
+    padding: 8px 20px;
     background: var(--bg-tertiary);
-    border-radius: 6px;
     color: var(--text-primary);
-    font-size: 20px;
+    border-radius: 8px;
   }
 
-  .close-btn:hover {
+  .cancel-btn:hover {
+    background: var(--bg-hover);
+  }
+
+  .confirm-actions .delete-btn {
+    padding: 8px 20px;
     background: var(--danger);
+    color: white;
+    border-radius: 8px;
+    font-weight: 600;
   }
 
-  video, audio {
-    display: block;
+  .confirm-actions .delete-btn:hover {
+    opacity: 0.9;
   }
 </style>

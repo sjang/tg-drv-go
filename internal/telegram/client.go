@@ -18,6 +18,7 @@ import (
 
 type Client struct {
 	client     *telegram.Client
+	waiter     *floodwait.Waiter
 	api        *tg.Client
 	uploader   *uploader.Uploader
 	downloader *downloader.Downloader
@@ -27,6 +28,7 @@ type Client struct {
 	mu          sync.RWMutex
 	ready       bool
 	readyCh     chan struct{}
+	runCtx      context.Context // context from inside client.Run callback
 	self        *tg.User
 	authPending *authState
 }
@@ -59,6 +61,7 @@ func NewClient(apiID int, apiHash string, db *storage.DB, logger *zap.Logger) *C
 
 	return &Client{
 		client:  client,
+		waiter:  waiter,
 		db:      db,
 		logger:  logger,
 		readyCh: make(chan struct{}),
@@ -66,35 +69,38 @@ func NewClient(apiID int, apiHash string, db *storage.DB, logger *zap.Logger) *C
 }
 
 func (c *Client) Run(ctx context.Context) error {
-	return c.client.Run(ctx, func(ctx context.Context) error {
-		c.mu.Lock()
-		c.api = c.client.API()
-		c.uploader = uploader.NewUploader(c.api).WithThreads(4)
-		c.downloader = downloader.NewDownloader()
-		c.mu.Unlock()
-
-		status, err := c.client.Auth().Status(ctx)
-		if err != nil {
-			return fmt.Errorf("auth status: %w", err)
-		}
-
-		if status.Authorized {
+	return c.waiter.Run(ctx, func(ctx context.Context) error {
+		return c.client.Run(ctx, func(ctx context.Context) error {
 			c.mu.Lock()
-			c.self = status.User
-			c.ready = true
+			c.api = c.client.API()
+			c.runCtx = ctx
+			c.uploader = uploader.NewUploader(c.api).WithThreads(4).WithPartSize(512 * 1024)
+			c.downloader = downloader.NewDownloader()
 			c.mu.Unlock()
-			close(c.readyCh)
-			c.logger.Info("authenticated", zap.String("user", status.User.FirstName))
-		} else {
-			c.mu.Lock()
-			c.ready = false
-			c.mu.Unlock()
-			close(c.readyCh)
-			c.logger.Info("not authenticated, waiting for login")
-		}
 
-		<-ctx.Done()
-		return ctx.Err()
+			status, err := c.client.Auth().Status(ctx)
+			if err != nil {
+				return fmt.Errorf("auth status: %w", err)
+			}
+
+			if status.Authorized {
+				c.mu.Lock()
+				c.self = status.User
+				c.ready = true
+				c.mu.Unlock()
+				close(c.readyCh)
+				c.logger.Info("authenticated", zap.String("user", status.User.FirstName))
+			} else {
+				c.mu.Lock()
+				c.ready = false
+				c.mu.Unlock()
+				close(c.readyCh)
+				c.logger.Info("not authenticated, waiting for login")
+			}
+
+			<-ctx.Done()
+			return ctx.Err()
+		})
 	})
 }
 
@@ -128,7 +134,27 @@ func (c *Client) GetAuthStatus() AuthStatus {
 	}
 }
 
-func (c *Client) SendCode(ctx context.Context, phone string) error {
+func (c *Client) getRunCtx() (context.Context, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.runCtx == nil {
+		return nil, fmt.Errorf("telegram client is not running yet")
+	}
+	return c.runCtx, nil
+}
+
+func (c *Client) SendCode(parentCtx context.Context, phone string) error {
+	// Wait for the client to be fully initialized before sending RPC
+	select {
+	case <-c.readyCh:
+	case <-parentCtx.Done():
+		return fmt.Errorf("send code: client not ready: %w", parentCtx.Err())
+	}
+
+	ctx, err := c.getRunCtx()
+	if err != nil {
+		return fmt.Errorf("send code: %w", err)
+	}
 	sentCode, err := c.client.Auth().SendCode(ctx, phone, auth.SendCodeOptions{})
 	if err != nil {
 		return fmt.Errorf("send code: %w", err)
@@ -149,7 +175,12 @@ func (c *Client) SendCode(ctx context.Context, phone string) error {
 	return nil
 }
 
-func (c *Client) VerifyCode(ctx context.Context, code string) error {
+func (c *Client) VerifyCode(_ context.Context, code string) error {
+	ctx, err := c.getRunCtx()
+	if err != nil {
+		return err
+	}
+
 	c.mu.RLock()
 	pending := c.authPending
 	c.mu.RUnlock()
@@ -187,8 +218,13 @@ func (c *Client) VerifyCode(ctx context.Context, code string) error {
 	return nil
 }
 
-func (c *Client) VerifyPassword(ctx context.Context, password string) error {
-	_, err := c.client.Auth().Password(ctx, password)
+func (c *Client) VerifyPassword(_ context.Context, password string) error {
+	ctx, err := c.getRunCtx()
+	if err != nil {
+		return err
+	}
+
+	_, err = c.client.Auth().Password(ctx, password)
 	if err != nil {
 		return fmt.Errorf("2fa: %w", err)
 	}

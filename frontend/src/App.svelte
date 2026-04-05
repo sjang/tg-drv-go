@@ -44,5 +44,6 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    --wails-drop-target: drop;
   }
 </style>

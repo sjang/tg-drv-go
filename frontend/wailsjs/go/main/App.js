@@ -14,12 +14,24 @@ export function DeleteFolder(arg1) {
   return window['go']['main']['App']['DeleteFolder'](arg1);
 }
 
+export function DownloadFileTo(arg1) {
+  return window['go']['main']['App']['DownloadFileTo'](arg1);
+}
+
+export function DownloadFilesTo(arg1) {
+  return window['go']['main']['App']['DownloadFilesTo'](arg1);
+}
+
 export function GetAPIPort() {
   return window['go']['main']['App']['GetAPIPort']();
 }
 
 export function GetAuthStatus() {
   return window['go']['main']['App']['GetAuthStatus']();
+}
+
+export function GetDownloadURL(arg1) {
+  return window['go']['main']['App']['GetDownloadURL'](arg1);
 }
 
 export function GetFiles(arg1) {
@@ -40,6 +52,10 @@ export function GetThumbnailURL(arg1) {
 
 export function IsConfigured() {
   return window['go']['main']['App']['IsConfigured']();
+}
+
+export function OpenPlayer(arg1) {
+  return window['go']['main']['App']['OpenPlayer'](arg1);
 }
 
 export function RebuildIndex(arg1) {
@@ -66,12 +82,20 @@ export function SyncFolders() {
   return window['go']['main']['App']['SyncFolders']();
 }
 
+export function ToggleFolderHidden(arg1, arg2) {
+  return window['go']['main']['App']['ToggleFolderHidden'](arg1, arg2);
+}
+
 export function UploadFile(arg1) {
   return window['go']['main']['App']['UploadFile'](arg1);
 }
 
 export function UploadFilePath(arg1, arg2) {
   return window['go']['main']['App']['UploadFilePath'](arg1, arg2);
+}
+
+export function UploadFiles(arg1) {
+  return window['go']['main']['App']['UploadFiles'](arg1);
 }
 
 export function VerifyAuthCode(arg1) {

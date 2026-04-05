@@ -30,6 +30,10 @@ func NewServer(tg *tgclient.Client, port int, logger *zap.Logger) *Server {
 	return s
 }
 
+func (s *Server) SetClient(tg *tgclient.Client) {
+	s.tg = tg
+}
+
 func (s *Server) setupRoutes() {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -57,6 +61,7 @@ func (s *Server) setupRoutes() {
 		r.Get("/files/{id}/download", s.handleDownloadFile)
 		r.Get("/files/{id}/stream", s.handleStreamFile)
 		r.Get("/files/{id}/thumbnail", s.handleThumbnail)
+		r.Get("/files/{id}/player", s.handlePlayer)
 		r.Put("/files/{id}", s.handleRenameFile)
 		r.Delete("/files/{id}", s.handleDeleteFile)
 
@@ -99,4 +104,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) Port() int {
 	return s.port
+}
+
+func (s *Server) Handler() http.Handler {
+	return s.router
 }

@@ -15,6 +15,7 @@ export interface Folder {
   updated_at: string;
   file_count?: number;
   total_size?: number;
+  hidden?: boolean;
 }
 
 export interface FileItem {

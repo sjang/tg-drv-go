@@ -9,6 +9,38 @@ import (
 	"github.com/gotd/td/tg"
 )
 
+type DownloadProgress struct {
+	FileID     string  `json:"file_id"`
+	FileName   string  `json:"file_name"`
+	Downloaded int64   `json:"downloaded"`
+	Total      int64   `json:"total"`
+	Percent    float64 `json:"percent"`
+}
+
+type progressWriter struct {
+	w          io.Writer
+	fileID     string
+	fileName   string
+	total      int64
+	written    int64
+	onProgress func(DownloadProgress)
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n, err := pw.w.Write(p)
+	pw.written += int64(n)
+	if pw.onProgress != nil && pw.total > 0 {
+		pw.onProgress(DownloadProgress{
+			FileID:     pw.fileID,
+			FileName:   pw.fileName,
+			Downloaded: pw.written,
+			Total:      pw.total,
+			Percent:    float64(pw.written) / float64(pw.total) * 100,
+		})
+	}
+	return n, err
+}
+
 type FileLocation struct {
 	InputLocation tg.InputFileLocationClass
 	Size          int64
@@ -27,8 +59,12 @@ func (c *Client) GetFileLocation(ctx context.Context, fileID string) (*FileLocat
 		return nil, fmt.Errorf("get folder: %w", err)
 	}
 
-	// Fetch the message to get the document
-	msgs, err := c.api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return nil, err
+	}
+
+	msgs, err := c.api.ChannelsGetMessages(runCtx, &tg.ChannelsGetMessagesRequest{
 		Channel: &tg.InputChannel{
 			ChannelID:  folder.ChannelID,
 			AccessHash: folder.AccessHash,
@@ -78,51 +114,97 @@ func (c *Client) GetFileLocation(ctx context.Context, fileID string) (*FileLocat
 	}, nil
 }
 
-func (c *Client) DownloadFile(ctx context.Context, fileID string, w io.Writer) error {
-	loc, err := c.GetFileLocation(ctx, fileID)
+func (c *Client) DownloadFile(_ context.Context, fileID string, w io.Writer) error {
+	runCtx, err := c.getRunCtx()
 	if err != nil {
 		return err
 	}
 
-	_, err = c.downloader.Download(c.api, loc.InputLocation).Stream(ctx, w)
+	loc, err := c.GetFileLocation(runCtx, fileID)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.downloader.Download(c.api, loc.InputLocation).Stream(runCtx, w)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
 	return nil
 }
 
-func (c *Client) DownloadRange(ctx context.Context, fileID string, w io.Writer, offset, limit int64) error {
-	loc, err := c.GetFileLocation(ctx, fileID)
+func (c *Client) DownloadFileWithProgress(_ context.Context, fileID string, w io.Writer, onProgress func(DownloadProgress)) error {
+	runCtx, err := c.getRunCtx()
 	if err != nil {
 		return err
 	}
 
-	// For range requests, we need to use the raw API to download chunks
-	// gotd/td downloader doesn't directly support offset-based streaming
-	// so we use GetFile API calls with offset
-	chunkSize := int64(1024 * 1024) // 1MB chunks
-	remaining := limit
+	loc, err := c.GetFileLocation(runCtx, fileID)
+	if err != nil {
+		return err
+	}
+
+	file, err := c.db.GetFile(fileID)
+	if err != nil {
+		return err
+	}
+
+	pw := &progressWriter{
+		w:          w,
+		fileID:     fileID,
+		fileName:   file.Name,
+		total:      loc.Size,
+		onProgress: onProgress,
+	}
+
+	_, err = c.downloader.Download(c.api, loc.InputLocation).Stream(runCtx, pw)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) DownloadRange(_ context.Context, fileID string, w io.Writer, offset, length int64) error {
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return err
+	}
+
+	loc, err := c.GetFileLocation(runCtx, fileID)
+	if err != nil {
+		return err
+	}
+
+	const chunkSize int64 = 1048576 // 1MB - Telegram requires offset % limit == 0
+
+	// Align offset down to chunk boundary
+	alignedOffset := (offset / chunkSize) * chunkSize
+	skip := offset - alignedOffset
+	remaining := length
+	currentOffset := alignedOffset
 
 	for remaining > 0 {
-		reqLimit := chunkSize
-		if remaining < reqLimit {
-			reqLimit = remaining
-		}
-		// Ensure limit is a valid power-of-2 multiple for Telegram
-		reqLimit = alignChunkSize(reqLimit)
-
-		result, err := c.api.UploadGetFile(ctx, &tg.UploadGetFileRequest{
+		result, err := c.api.UploadGetFile(runCtx, &tg.UploadGetFileRequest{
 			Location: loc.InputLocation,
-			Offset:   offset,
-			Limit:    int(reqLimit),
+			Offset:   currentOffset,
+			Limit:    int(chunkSize),
 		})
 		if err != nil {
-			return fmt.Errorf("get file chunk: %w", err)
+			return fmt.Errorf("get file chunk at offset %d: %w", currentOffset, err)
 		}
 
 		switch f := result.(type) {
 		case *tg.UploadFile:
 			data := f.Bytes
+			// Skip leading bytes for the first chunk if offset wasn't aligned
+			if skip > 0 {
+				if int64(len(data)) <= skip {
+					skip -= int64(len(data))
+					currentOffset += int64(len(data))
+					continue
+				}
+				data = data[skip:]
+				skip = 0
+			}
 			if int64(len(data)) > remaining {
 				data = data[:remaining]
 			}
@@ -130,11 +212,10 @@ func (c *Client) DownloadRange(ctx context.Context, fileID string, w io.Writer, 
 			if err != nil {
 				return err
 			}
-			offset += int64(n)
 			remaining -= int64(n)
-			if len(f.Bytes) < int(reqLimit) {
-				// EOF
-				return nil
+			currentOffset += chunkSize
+			if len(f.Bytes) < int(chunkSize) {
+				return nil // EOF
 			}
 		case *tg.UploadFileCDNRedirect:
 			return fmt.Errorf("CDN redirect not supported")
@@ -143,17 +224,24 @@ func (c *Client) DownloadRange(ctx context.Context, fileID string, w io.Writer, 
 	return nil
 }
 
+// alignChunkSize rounds up to the nearest power-of-2 multiple of 4096.
+// Telegram's upload.getFile requires limit to be one of:
+// 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576
 func alignChunkSize(size int64) int64 {
-	// Telegram requires chunk size to be a multiple of 4096
-	// and between 4096 and 1048576
-	if size < 4096 {
+	if size <= 4096 {
 		return 4096
 	}
 	if size > 1048576 {
 		return 1048576
 	}
-	// Round up to nearest 4096
-	return ((size + 4095) / 4096) * 4096
+	// Round up to next power of 2
+	v := size - 1
+	v |= v >> 1
+	v |= v >> 2
+	v |= v >> 4
+	v |= v >> 8
+	v |= v >> 16
+	return v + 1
 }
 
 // unused import guard
