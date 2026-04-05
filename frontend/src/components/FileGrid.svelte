@@ -17,8 +17,19 @@
     selectedIds = new Set();
   }
 
-  // Clear selection when folder changes
-  $: if ($currentFolder) clearSelection();
+  // Clear selection when folder changes (including leaving a folder)
+  let prevFolderId: string | null = null;
+  $: {
+    const id = $currentFolder?.id ?? null;
+    if (id !== prevFolderId) {
+      prevFolderId = id;
+      selectedIds = new Set();
+      lastClickedId = null;
+      contextMenu = null;
+      deleteConfirm = null;
+      deleteMultiConfirm = false;
+    }
+  }
 
   function toggleSelect(e: MouseEvent, file: FileItem) {
     e.stopPropagation();

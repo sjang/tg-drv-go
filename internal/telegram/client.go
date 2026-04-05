@@ -3,7 +3,9 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gotd/contrib/middleware/floodwait"
 	"github.com/gotd/td/telegram"
@@ -155,8 +157,20 @@ func (c *Client) SendCode(parentCtx context.Context, phone string) error {
 	if err != nil {
 		return fmt.Errorf("send code: %w", err)
 	}
-	sentCode, err := c.client.Auth().SendCode(ctx, phone, auth.SendCodeOptions{})
-	if err != nil {
+
+	// AUTH_RESTART can occur when the session is not fully ready on first launch.
+	// Retry a few times with a short delay.
+	var sentCode tg.AuthSentCodeClass
+	for attempt := 0; attempt < 3; attempt++ {
+		sentCode, err = c.client.Auth().SendCode(ctx, phone, auth.SendCodeOptions{})
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "AUTH_RESTART") && attempt < 2 {
+			c.logger.Warn("AUTH_RESTART, retrying", zap.Int("attempt", attempt+1))
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+			continue
+		}
 		return fmt.Errorf("send code: %w", err)
 	}
 
