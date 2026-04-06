@@ -26,6 +26,7 @@ type Client struct {
 	downloader *downloader.Downloader
 	db         *storage.DB
 	logger     *zap.Logger
+	locCache   *fileLocationCache
 
 	mu          sync.RWMutex
 	ready       bool
@@ -62,11 +63,12 @@ func NewClient(apiID int, apiHash string, db *storage.DB, logger *zap.Logger) *C
 	})
 
 	return &Client{
-		client:  client,
-		waiter:  waiter,
-		db:      db,
-		logger:  logger,
-		readyCh: make(chan struct{}),
+		client:   client,
+		waiter:   waiter,
+		db:       db,
+		logger:   logger,
+		readyCh:  make(chan struct{}),
+		locCache: newFileLocationCache(),
 	}
 }
 
@@ -77,7 +79,7 @@ func (c *Client) Run(ctx context.Context) error {
 			c.api = c.client.API()
 			c.runCtx = ctx
 			c.uploader = uploader.NewUploader(c.api).WithThreads(4).WithPartSize(512 * 1024)
-			c.downloader = downloader.NewDownloader()
+			c.downloader = downloader.NewDownloader().WithPartSize(1048576).WithAllowCDN(true)
 			c.mu.Unlock()
 
 			status, err := c.client.Auth().Status(ctx)

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/gotd/td/tg"
 )
@@ -48,7 +50,51 @@ type FileLocation struct {
 	FileName      string
 }
 
+// fileLocationCache caches FileLocation lookups to avoid repeated Telegram API calls
+// during video streaming where the player issues many Range requests.
+type fileLocationCache struct {
+	mu      sync.RWMutex
+	entries map[string]*cachedLocation
+}
+
+type cachedLocation struct {
+	loc       *FileLocation
+	expiresAt time.Time
+}
+
+const fileLocationCacheTTL = 5 * time.Minute
+
+func newFileLocationCache() *fileLocationCache {
+	return &fileLocationCache{
+		entries: make(map[string]*cachedLocation),
+	}
+}
+
+func (c *fileLocationCache) get(fileID string) (*FileLocation, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, ok := c.entries[fileID]
+	if !ok || time.Now().After(entry.expiresAt) {
+		return nil, false
+	}
+	return entry.loc, true
+}
+
+func (c *fileLocationCache) set(fileID string, loc *FileLocation) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[fileID] = &cachedLocation{
+		loc:       loc,
+		expiresAt: time.Now().Add(fileLocationCacheTTL),
+	}
+}
+
 func (c *Client) GetFileLocation(ctx context.Context, fileID string) (*FileLocation, error) {
+	// Check cache first to avoid Telegram API round-trip on repeated Range requests
+	if cached, ok := c.locCache.get(fileID); ok {
+		return cached, nil
+	}
+
 	file, err := c.db.GetFile(fileID)
 	if err != nil {
 		return nil, fmt.Errorf("get file: %w", err)
@@ -102,7 +148,7 @@ func (c *Client) GetFileLocation(ctx context.Context, fileID string) (*FileLocat
 		return nil, fmt.Errorf("unexpected document type")
 	}
 
-	return &FileLocation{
+	loc := &FileLocation{
 		InputLocation: &tg.InputDocumentFileLocation{
 			ID:            doc.ID,
 			AccessHash:    doc.AccessHash,
@@ -111,7 +157,12 @@ func (c *Client) GetFileLocation(ctx context.Context, fileID string) (*FileLocat
 		Size:     doc.Size,
 		MimeType: file.MimeType,
 		FileName: file.Name,
-	}, nil
+	}
+
+	// Cache the resolved location for subsequent Range requests
+	c.locCache.set(fileID, loc)
+
+	return loc, nil
 }
 
 func (c *Client) DownloadFile(_ context.Context, fileID string, w io.Writer) error {
@@ -163,6 +214,14 @@ func (c *Client) DownloadFileWithProgress(_ context.Context, fileID string, w io
 	return nil
 }
 
+// chunkResult holds the result of a prefetched chunk.
+type chunkResult struct {
+	data   []byte
+	offset int64
+	eof    bool
+	err    error
+}
+
 func (c *Client) DownloadRange(_ context.Context, fileID string, w io.Writer, offset, length int64) error {
 	runCtx, err := c.getRunCtx()
 	if err != nil {
@@ -182,43 +241,78 @@ func (c *Client) DownloadRange(_ context.Context, fileID string, w io.Writer, of
 	remaining := length
 	currentOffset := alignedOffset
 
+	// Prefetch: start fetching the next chunk while processing the current one
+	fetchChunk := func(off int64) <-chan chunkResult {
+		ch := make(chan chunkResult, 1)
+		go func() {
+			result, err := c.api.UploadGetFile(runCtx, &tg.UploadGetFileRequest{
+				Location: loc.InputLocation,
+				Offset:   off,
+				Limit:    int(chunkSize),
+			})
+			if err != nil {
+				ch <- chunkResult{err: fmt.Errorf("get file chunk at offset %d: %w", off, err)}
+				return
+			}
+			switch f := result.(type) {
+			case *tg.UploadFile:
+				ch <- chunkResult{
+					data:   f.Bytes,
+					offset: off,
+					eof:    len(f.Bytes) < int(chunkSize),
+				}
+			case *tg.UploadFileCDNRedirect:
+				ch <- chunkResult{err: fmt.Errorf("CDN redirect not supported")}
+			}
+		}()
+		return ch
+	}
+
+	// Start first fetch
+	pending := fetchChunk(currentOffset)
+
 	for remaining > 0 {
-		result, err := c.api.UploadGetFile(runCtx, &tg.UploadGetFileRequest{
-			Location: loc.InputLocation,
-			Offset:   currentOffset,
-			Limit:    int(chunkSize),
-		})
-		if err != nil {
-			return fmt.Errorf("get file chunk at offset %d: %w", currentOffset, err)
+		res := <-pending
+		if res.err != nil {
+			return res.err
 		}
 
-		switch f := result.(type) {
-		case *tg.UploadFile:
-			data := f.Bytes
-			// Skip leading bytes for the first chunk if offset wasn't aligned
-			if skip > 0 {
-				if int64(len(data)) <= skip {
-					skip -= int64(len(data))
-					currentOffset += int64(len(data))
-					continue
+		// Start prefetching next chunk before processing current one
+		nextOffset := currentOffset + chunkSize
+		var nextPending <-chan chunkResult
+		if remaining > 0 && !res.eof {
+			nextPending = fetchChunk(nextOffset)
+		}
+
+		data := res.data
+		if skip > 0 {
+			if int64(len(data)) <= skip {
+				skip -= int64(len(data))
+				currentOffset += int64(len(data))
+				if nextPending != nil {
+					pending = nextPending
 				}
-				data = data[skip:]
-				skip = 0
+				continue
 			}
-			if int64(len(data)) > remaining {
-				data = data[:remaining]
-			}
-			n, err := w.Write(data)
-			if err != nil {
-				return err
-			}
-			remaining -= int64(n)
-			currentOffset += chunkSize
-			if len(f.Bytes) < int(chunkSize) {
-				return nil // EOF
-			}
-		case *tg.UploadFileCDNRedirect:
-			return fmt.Errorf("CDN redirect not supported")
+			data = data[skip:]
+			skip = 0
+		}
+		if int64(len(data)) > remaining {
+			data = data[:remaining]
+		}
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		remaining -= int64(n)
+		currentOffset += chunkSize
+
+		if res.eof {
+			return nil
+		}
+
+		if nextPending != nil {
+			pending = nextPending
 		}
 	}
 	return nil

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/md5"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -38,8 +39,18 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ETag based on file ID and size for cache validation
+	etag := fmt.Sprintf(`"%x"`, md5.Sum([]byte(fmt.Sprintf("%s-%d", fileID, file.Size))))
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", file.MimeType)
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("ETag", etag)
+
+	// Handle conditional request
+	if match := r.Header.Get("If-None-Match"); match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 
 	rangeHeader := r.Header.Get("Range")
 
