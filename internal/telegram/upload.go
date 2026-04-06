@@ -50,7 +50,15 @@ func (p *progressCallback) Chunk(_ context.Context, state uploader.ProgressState
 	return nil
 }
 
-func (c *Client) UploadFile(ctx context.Context, folderID, localPath string, onProgress func(UploadProgress)) (*storage.File, error) {
+func (c *Client) UploadFile(clientCtx context.Context, folderID, localPath string, onProgress func(UploadProgress)) (*storage.File, error) {
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return nil, fmt.Errorf("telegram client not running: %w", err)
+	}
+
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
 	// Get folder
 	folder, err := c.db.GetFolder(folderID)
 	if err != nil {
@@ -92,8 +100,11 @@ func (c *Client) UploadFile(ctx context.Context, folderID, localPath string, onP
 		return c.forwardFile(ctx, dup, folder, fileName, fileSize, mimeType, fileHash)
 	}
 
-	// Upload new file with progress tracking
-	u := c.uploader
+	// Upload new file with progress tracking (use thread-safe accessor)
+	u := c.Uploader()
+	if u == nil {
+		return nil, fmt.Errorf("uploader not initialized")
+	}
 	if onProgress != nil {
 		u = u.WithProgress(&progressCallback{
 			fileID:   folderID + ":" + fileName,
@@ -228,7 +239,14 @@ func extractMessageID(updates tg.UpdatesClass) int {
 	return 0
 }
 
-func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
+func (c *Client) DeleteFile(clientCtx context.Context, fileID string) error {
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
 	file, err := c.db.GetFile(fileID)
 	if err != nil {
 		return fmt.Errorf("get file: %w", err)
@@ -253,7 +271,14 @@ func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
 	return c.db.DeleteFile(fileID)
 }
 
-func (c *Client) RenameFile(ctx context.Context, fileID, newName string) error {
+func (c *Client) RenameFile(clientCtx context.Context, fileID, newName string) error {
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
 	file, err := c.db.GetFile(fileID)
 	if err != nil {
 		return err

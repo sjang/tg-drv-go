@@ -14,7 +14,14 @@ import (
 	"tg-drv-go/internal/storage"
 )
 
-func (c *Client) CreateChannel(ctx context.Context, title string) (*storage.Folder, error) {
+func (c *Client) CreateChannel(clientCtx context.Context, title string) (*storage.Folder, error) {
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
 	updates, err := c.api.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
 		Title:     title,
 		About:     "tg-drv storage folder",
@@ -58,7 +65,14 @@ func (c *Client) CreateChannel(ctx context.Context, title string) (*storage.Fold
 	return folder, nil
 }
 
-func (c *Client) DeleteChannel(ctx context.Context, folderID string) error {
+func (c *Client) DeleteChannel(clientCtx context.Context, folderID string) error {
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
 	folder, err := c.db.GetFolder(folderID)
 	if err != nil {
 		return fmt.Errorf("get folder: %w", err)
@@ -75,7 +89,14 @@ func (c *Client) DeleteChannel(ctx context.Context, folderID string) error {
 	return c.db.DeleteFolder(folderID)
 }
 
-func (c *Client) RenameChannel(ctx context.Context, folderID, newName string) error {
+func (c *Client) RenameChannel(clientCtx context.Context, folderID, newName string) error {
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
 	folder, err := c.db.GetFolder(folderID)
 	if err != nil {
 		return err
@@ -95,7 +116,14 @@ func (c *Client) RenameChannel(ctx context.Context, folderID, newName string) er
 	return c.db.UpdateFolder(folderID, newName)
 }
 
-func (c *Client) SyncChannels(ctx context.Context) ([]storage.Folder, error) {
+func (c *Client) SyncChannels(clientCtx context.Context) ([]storage.Folder, error) {
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
 	dialogs, err := c.api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
 		OffsetPeer: &tg.InputPeerEmpty{},
 		Limit:      500,
@@ -187,7 +215,14 @@ func ParseCaption(caption string) (filename, mimeType, hash string, size int64, 
 }
 
 // RebuildIndex performs incremental sync: fetches only new messages and verifies deletions.
-func (c *Client) RebuildIndex(ctx context.Context, folderID string) (int, error) {
+func (c *Client) RebuildIndex(clientCtx context.Context, folderID string) (int, error) {
+	runCtx, err := c.getRunCtx()
+	if err != nil {
+		return 0, err
+	}
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
 	folder, err := c.db.GetFolder(folderID)
 	if err != nil {
 		return 0, err

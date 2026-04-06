@@ -206,6 +206,7 @@ func (a *App) UploadFiles(folderID string) (int, error) {
 
 	total := len(paths)
 	uploaded := 0
+	var lastErr error
 	for i, p := range paths {
 		runtime.EventsEmit(a.ctx, "upload:queue", map[string]int{"current": i + 1, "total": total})
 		_, err := a.tg.UploadFile(a.ctx, folderID, p, func(prog telegram.UploadProgress) {
@@ -213,11 +214,15 @@ func (a *App) UploadFiles(folderID string) (int, error) {
 		})
 		if err != nil {
 			a.logger.Warn("upload failed", zap.String("path", p), zap.Error(err))
+			lastErr = err
 			continue
 		}
 		uploaded++
 	}
 	runtime.EventsEmit(a.ctx, "upload:queue", map[string]int{"current": 0, "total": 0})
+	if uploaded == 0 && lastErr != nil {
+		return 0, fmt.Errorf("upload failed: %w", lastErr)
+	}
 	return uploaded, nil
 }
 

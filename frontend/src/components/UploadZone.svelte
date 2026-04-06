@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { OnFileDrop, OnFileDropOff } from '../../wailsjs/runtime/runtime';
-  import { currentFolder, uploadQueue, refreshFiles } from '../lib/stores';
+  import { currentFolder, uploadQueue, refreshFiles, errorMessage } from '../lib/stores';
   import { UploadFilePath } from '../lib/api';
 
   let isDragging = false;
@@ -47,6 +47,8 @@
           await UploadFilePath($currentFolder.id, paths[i]);
         } catch (err) {
           console.error('upload error:', paths[i], err);
+          errorMessage.set('Upload failed: ' + paths[i].split('/').pop() + ' - ' + String(err));
+          setTimeout(() => errorMessage.set(null), 5000);
         }
       }
       await refreshFiles();

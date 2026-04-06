@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { currentFolder, viewMode, files, isLoading, refreshFiles } from '../lib/stores';
+  import { currentFolder, viewMode, files, isLoading, refreshFiles, errorMessage } from '../lib/stores';
   import { UploadFiles, RebuildIndex } from '../lib/api';
 
   let rebuilding = false;
@@ -8,12 +8,19 @@
   async function uploadFiles() {
     if (!$currentFolder) return;
     try {
-      await UploadFiles($currentFolder.id);
+      const count = await UploadFiles($currentFolder.id);
       await refreshFiles();
+      if (count === 0) {
+        // All uploads may have failed silently on the Go side
+        errorMessage.set('Upload completed but no files were added. Check if files already exist.');
+        setTimeout(() => errorMessage.set(null), 5000);
+      }
     } catch (e) {
       // "no files selected" is not a real error
       if (String(e).includes('no files selected')) return;
       console.error('upload:', e);
+      errorMessage.set('Upload failed: ' + String(e));
+      setTimeout(() => errorMessage.set(null), 5000);
     }
   }
 
