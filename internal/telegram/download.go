@@ -165,31 +165,51 @@ func (c *Client) GetFileLocation(ctx context.Context, fileID string) (*FileLocat
 	return loc, nil
 }
 
-func (c *Client) DownloadFile(_ context.Context, fileID string, w io.Writer) error {
+// mergeContexts returns a context that is cancelled when either ctx or runCtx is done.
+// This ensures that client disconnects (e.g. video seek) cancel in-flight Telegram API calls.
+func mergeContexts(clientCtx, runCtx context.Context) (context.Context, context.CancelFunc) {
+	merged, cancel := context.WithCancel(runCtx)
+	go func() {
+		select {
+		case <-clientCtx.Done():
+			cancel()
+		case <-merged.Done():
+		}
+	}()
+	return merged, cancel
+}
+
+func (c *Client) DownloadFile(clientCtx context.Context, fileID string, w io.Writer) error {
 	runCtx, err := c.getRunCtx()
 	if err != nil {
 		return err
 	}
 
-	loc, err := c.GetFileLocation(runCtx, fileID)
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
+	loc, err := c.GetFileLocation(ctx, fileID)
 	if err != nil {
 		return err
 	}
 
-	_, err = c.downloader.Download(c.api, loc.InputLocation).Stream(runCtx, w)
+	_, err = c.downloader.Download(c.api, loc.InputLocation).Stream(ctx, w)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
 	return nil
 }
 
-func (c *Client) DownloadFileWithProgress(_ context.Context, fileID string, w io.Writer, onProgress func(DownloadProgress)) error {
+func (c *Client) DownloadFileWithProgress(clientCtx context.Context, fileID string, w io.Writer, onProgress func(DownloadProgress)) error {
 	runCtx, err := c.getRunCtx()
 	if err != nil {
 		return err
 	}
 
-	loc, err := c.GetFileLocation(runCtx, fileID)
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
+	loc, err := c.GetFileLocation(ctx, fileID)
 	if err != nil {
 		return err
 	}
@@ -207,7 +227,7 @@ func (c *Client) DownloadFileWithProgress(_ context.Context, fileID string, w io
 		onProgress: onProgress,
 	}
 
-	_, err = c.downloader.Download(c.api, loc.InputLocation).Stream(runCtx, pw)
+	_, err = c.downloader.Download(c.api, loc.InputLocation).Stream(ctx, pw)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
@@ -222,13 +242,16 @@ type chunkResult struct {
 	err    error
 }
 
-func (c *Client) DownloadRange(_ context.Context, fileID string, w io.Writer, offset, length int64) error {
+func (c *Client) DownloadRange(clientCtx context.Context, fileID string, w io.Writer, offset, length int64) error {
 	runCtx, err := c.getRunCtx()
 	if err != nil {
 		return err
 	}
 
-	loc, err := c.GetFileLocation(runCtx, fileID)
+	ctx, cancel := mergeContexts(clientCtx, runCtx)
+	defer cancel()
+
+	loc, err := c.GetFileLocation(ctx, fileID)
 	if err != nil {
 		return err
 	}
@@ -241,11 +264,21 @@ func (c *Client) DownloadRange(_ context.Context, fileID string, w io.Writer, of
 	remaining := length
 	currentOffset := alignedOffset
 
-	// Prefetch: start fetching the next chunk while processing the current one
+	// Prefetch: start fetching the next chunk while processing the current one.
+	// Uses semaphore (c.dlSem) to limit concurrent Telegram API calls.
 	fetchChunk := func(off int64) <-chan chunkResult {
 		ch := make(chan chunkResult, 1)
 		go func() {
-			result, err := c.api.UploadGetFile(runCtx, &tg.UploadGetFileRequest{
+			// Acquire semaphore; respect context cancellation while waiting
+			select {
+			case c.dlSem <- struct{}{}:
+			case <-ctx.Done():
+				ch <- chunkResult{err: ctx.Err()}
+				return
+			}
+			defer func() { <-c.dlSem }()
+
+			result, err := c.api.UploadGetFile(ctx, &tg.UploadGetFileRequest{
 				Location: loc.InputLocation,
 				Offset:   off,
 				Limit:    int(chunkSize),

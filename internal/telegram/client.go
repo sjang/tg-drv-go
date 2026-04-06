@@ -27,6 +27,7 @@ type Client struct {
 	db         *storage.DB
 	logger     *zap.Logger
 	locCache   *fileLocationCache
+	dlSem      chan struct{} // semaphore to limit concurrent Telegram download API calls
 
 	mu          sync.RWMutex
 	ready       bool
@@ -69,6 +70,7 @@ func NewClient(apiID int, apiHash string, db *storage.DB, logger *zap.Logger) *C
 		logger:   logger,
 		readyCh:  make(chan struct{}),
 		locCache: newFileLocationCache(),
+		dlSem:    make(chan struct{}, 8), // max 8 concurrent Telegram download API calls
 	}
 }
 

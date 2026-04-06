@@ -123,7 +123,7 @@ func (s *Server) handlePlayer(w http.ResponseWriter, r *http.Request) {
 	streamURL := fmt.Sprintf("/api/files/%s/stream", fileID)
 	var mediaTag string
 	if strings.HasPrefix(file.MimeType, "video/") {
-		mediaTag = fmt.Sprintf(`<video controls autoplay src="%s" style="max-width:100vw;max-height:100vh;"></video>`, streamURL)
+		mediaTag = fmt.Sprintf(`<video controls autoplay preload="auto" src="%s" style="max-width:100vw;max-height:100vh;"></video>`, streamURL)
 	} else if strings.HasPrefix(file.MimeType, "audio/") {
 		mediaTag = fmt.Sprintf(`<audio controls autoplay src="%s"></audio>`, streamURL)
 	} else if strings.HasPrefix(file.MimeType, "image/") {

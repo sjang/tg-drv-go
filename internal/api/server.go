@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -88,8 +89,12 @@ func corsMiddleware(next http.Handler) http.Handler {
 func (s *Server) Start() error {
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
 	s.server = &http.Server{
-		Addr:    addr,
-		Handler: s.router,
+		Addr:              addr,
+		Handler:           s.router,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// No WriteTimeout — streaming responses can take arbitrarily long
+		// depending on file size and Telegram API latency.
 	}
 	s.logger.Info("starting API server", zap.String("addr", addr))
 	return s.server.ListenAndServe()
